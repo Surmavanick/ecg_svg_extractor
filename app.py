@@ -1,84 +1,71 @@
 import io
-import json
 import re
+import numpy as np
+import pandas as pd
 from flask import Flask, render_template, request, send_file
 import xml.etree.ElementTree as ET
 from svg.path import parse_path
 
 app = Flask(__name__)
 
-# --- Limits to prevent OOM on Render ---
-MAX_POINTS_PER_PATH = 300
-MAX_TOTAL_POINTS = 20000
+# --- კონფიგურაცია ---
+PX_PER_MM = 2.833  # SVG calibration (viewBox 595 / width 210mm)
+MM_PER_MV = 10
+MM_PER_S = 25
+PX_PER_MV = PX_PER_MM * MM_PER_MV  # 28.33 px/mV
+MAX_PATHS = 50
 
 
-def sample_path_points(d_attr, samples=50, max_points=MAX_POINTS_PER_PATH):
-    """Sample SVG <path> d attribute into list of [x,y] points."""
+def sample_path_points(d_attr, samples=50):
+    """Sample SVG <path> d attribute into [x, y] წერტილები."""
     try:
         path = parse_path(d_attr)
     except Exception:
-        return []
+        return np.empty((0, 2))
 
     coords = []
     for seg in path:
-        n = min(samples, max_points)
-        for i in range(n):
-            t = i / (n - 1)
+        for i in range(samples):
+            t = i / (samples - 1)
             pt = seg.point(t)
             coords.append([float(pt.real), float(pt.imag)])
-            if len(coords) >= max_points:
-                return coords
-    return coords
+    return np.array(coords)
 
 
-def parse_poly_points(points_str):
-    """Convert points='x1,y1 x2,y2 ...' to list of [x,y]."""
-    if not points_str:
-        return []
-    nums = [float(x) for x in re.split(r"[,\s]+", points_str.strip()) if x]
-    return [[nums[i], nums[i + 1]] for i in range(0, len(nums) - 1, 2)]
-
-
-def extract_coordinates(svg_text):
-    """Extract all coordinates from SVG <path>, <polyline>, and <line>."""
-    try:
-        root = ET.fromstring(svg_text)
-    except Exception:
-        return {"error": "Invalid SVG format"}
-
+def extract_leads_from_svg(svg_text):
+    """ECG lead-ების გამოყოფა SVG-დან და CSV ფორმატში მომზადება."""
+    root = ET.fromstring(svg_text)
     ns = {"svg": "http://www.w3.org/2000/svg"}
     paths = root.findall(".//svg:path", ns)
-    polylines = root.findall(".//svg:polyline", ns)
-    lines = root.findall(".//svg:line", ns)
 
-    all_coords = []
-    for p in paths:
+    all_signals = []
+    for p in paths[:MAX_PATHS]:
         d = p.get("d")
-        if d:
-            pts = sample_path_points(d)
-            all_coords.extend(pts)
-            if len(all_coords) >= MAX_TOTAL_POINTS:
-                break
-
-    for pl in polylines:
-        pts = parse_poly_points(pl.get("points"))
-        all_coords.extend(pts)
-        if len(all_coords) >= MAX_TOTAL_POINTS:
-            break
-
-    for ln in lines:
-        try:
-            x1 = float(ln.get("x1", "0"))
-            y1 = float(ln.get("y1", "0"))
-            x2 = float(ln.get("x2", "0"))
-            y2 = float(ln.get("y2", "0"))
-            all_coords.extend([[x1, y1], [x2, y2]])
-        except Exception:
+        if not d:
             continue
-        if len(all_coords) >= MAX_TOTAL_POINTS:
-            break
+        pts = sample_path_points(d)
+        if len(pts) > 10:
+            all_signals.append(pts)
 
-    return {"count": len(all_coords), "coordinates": all_coords}
+    # y-ს საშუალო პოზიციით დავახარისხოთ ბლოკებად
+    ys = [np.mean(sig[:, 1]) for sig in all_signals]
+    sorted_indices = np.argsort(ys)
+    leads = [all_signals[i] for i in sorted_indices[:12]]
+
+    lead_names = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
+    max_len = max(len(sig) for sig in leads)
+    data = np.full((max_len, len(leads)), np.nan)
+
+    for i, sig in enumerate(leads):
+        y = sig[:, 1]
+        y = -(y - np.mean(y)) / PX_PER_MV  # კონვერტაცია mV-ში
+        data[:len(y), i] = y
+
+    df = pd.DataFrame(data, columns=lead_names)
+    mem = io.BytesIO()
+    df.to_csv(mem, index=False, float_format="%.5f")
+    mem.seek(0)
+    return mem
 
 
 @app.route("/")
@@ -96,15 +83,15 @@ def upload():
 
     svg_text = f.read().decode("utf-8", errors="ignore")
 
-    result = extract_coordinates(svg_text)
-    result["source_svg"] = f.filename
+    csv_mem = extract_leads_from_svg(svg_text)
+    csv_name = f"{f.filename.rsplit('.',1)[0]}_leads.csv"
 
-    mem = io.BytesIO()
-    mem.write(json.dumps(result, indent=2, ensure_ascii=False).encode("utf-8"))
-    mem.seek(0)
-
-    json_name = f"{f.filename.rsplit('.',1)[0]}_coords.json"
-    return send_file(mem, as_attachment=True, download_name=json_name, mimetype="application/json")
+    return send_file(
+        csv_mem,
+        as_attachment=True,
+        download_name=csv_name,
+        mimetype="text/csv"
+    )
 
 
 if __name__ == "__main__":
