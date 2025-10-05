@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SVG-დან კოორდინატების ამოღება</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="container">
+    <h1>ატვირთეთ SVG ფაილი</h1>
+    <p>სისტემა ამოიღებს ყველა path/polyline/line კოორდინატს და მოგცემთ JSON ფაილად.</p>
+    <form action="/upload" method="post" enctype="multipart/form-data">
+      <input type="file" name="svg_file" accept=".svg" required>
+      <button type="submit">დამუშავება და გადმოწერა</button>
+    </form>
+  </div>
+</body>
+</html>
