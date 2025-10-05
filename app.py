@@ -59,9 +59,11 @@ def _median_neighbor_spacing(values):
     return float(np.median(core))
 
 def detect_px_per_mm_from_grid(root):
+    """დაითვლის px_per_mm-ს ბადის ან ფაილის ზომების მიხედვით."""
     ns = {"svg": "http://www.w3.org/2000/svg"}
     xs, ys = [], []
 
+    # მოძებნე ბადის ხაზები
     for ln in root.findall(".//svg:line", ns):
         x1 = ln.get("x1"); x2 = ln.get("x2")
         y1 = ln.get("y1"); y2 = ln.get("y2")
@@ -78,6 +80,8 @@ def detect_px_per_mm_from_grid(root):
     px_step_x = _median_neighbor_spacing(xs) if len(xs) > 0 else None
     px_step_y = _median_neighbor_spacing(ys) if len(ys) > 0 else None
     steps = [s for s in [px_step_x, px_step_y] if s]
+
+    # --- თუ ბადე ვერ იპოვა ---
     if not steps:
         vb = _get_viewbox(root)
         width_attr = root.get("width")
@@ -85,7 +89,8 @@ def detect_px_per_mm_from_grid(root):
             w_val, w_unit = _parse_float_with_unit(width_attr)
             if w_unit == "mm":
                 return vb[2] / max(w_val, 1e-9)
-        return 3.7795275591  # fallback
+        # 👉 ECG ვექტორული ფაილებისთვის გამოიყენე A4 სტანდარტი (210 mm → 595 px)
+        return 595.0 / 210.0  # = 2.83 px/mm
 
     step = float(np.median(steps))
     per_mm_guess = step / 5.0
@@ -109,7 +114,6 @@ def parse_text_meta_and_labels(root):
         txt = "".join(t.itertext()).strip()
         if not txt:
             continue
-
         m1 = mmps_re.search(txt)
         if m1: meta["mm_per_s"] = float(m1.group(1))
         m2 = mmpmV_re.search(txt)
@@ -132,7 +136,6 @@ def parse_text_meta_and_labels(root):
                         break
             except:
                 pass
-
     return meta, label_pos
 
 # -------------------- Lead picking --------------------
@@ -215,24 +218,20 @@ def pick_12_leads_from_paths(root, px_per_mm):
 def validate_backprojection(xy_px, px_per_mm, baseline_px, v_u, fs=TARGET_FS):
     if xy_px.size == 0 or len(v_u) == 0:
         return None
-
     t_sec = (xy_px[:,0] / px_per_mm)
     order = np.argsort(t_sec)
     t = t_sec[order]; y = xy_px[:,1][order]
     t, uniq = np.unique(t, return_index=True); y = y[uniq]
-
     dt = 1.0/fs
     t0, t1 = float(t.min()), float(t.max())
     n = int((t1 - t0)/dt) + 1
     t_u = t0 + np.arange(n)*dt
     y_interp = np.interp(t_u, t, y)
     y_hat = baseline_px - (v_u * (px_per_mm * MM_PER_MV_DEFAULT))
-
     n_min = min(len(y_hat), len(y_interp))
     if n_min < 10:
         return None
     y_hat, y_interp = y_hat[:n_min], y_interp[:n_min]
-
     err = y_hat - y_interp
     rmse = float(np.sqrt(np.mean(err**2)))
     rng = float(np.sqrt(np.mean((y_interp - np.median(y_interp))**2)))
@@ -276,7 +275,6 @@ def extract_csv_and_report(svg_text, target_fs=TARGET_FS):
 
     if min_len is math.inf:
         min_len = 0
-
     data = np.full((min_len, 12), np.nan, dtype=float)
     for j, v in enumerate(waveforms):
         if len(v) >= min_len and min_len > 0:
@@ -295,15 +293,12 @@ def extract_csv_and_report(svg_text, target_fs=TARGET_FS):
     if overall < 80:
         header["warning"] = "low signal match (<80%)"
 
-    # CSV memory
     mem = io.StringIO()
-    # --- ჩაწერა report-ის თავში ---
     for k, v in header.items():
         mem.write(f"{k},{v}\n")
-    mem.write("\n")  # გამყოფი ხაზით
+    mem.write("\n")
     df.to_csv(mem, index=False, float_format="%.5f")
     mem.seek(0)
-
     return io.BytesIO(mem.getvalue().encode("utf-8"))
 
 # -------------------- Flask --------------------
@@ -319,11 +314,9 @@ def upload():
     f = request.files["svg_file"]
     if not f.filename.lower().endswith(".svg"):
         return "Invalid file type", 400
-
     svg_text = f.read().decode("utf-8", errors="ignore")
     csv_mem = extract_csv_and_report(svg_text, target_fs=TARGET_FS)
     base = f.filename.rsplit(".",1)[0]
-
     return send_file(csv_mem, as_attachment=True,
                      download_name=f"{base}_leads.csv",
                      mimetype="text/csv")
