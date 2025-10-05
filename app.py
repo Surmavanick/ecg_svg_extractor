@@ -213,37 +213,30 @@ def pick_12_leads_from_paths(root, px_per_mm):
 # -------------------- Validation --------------------
 
 def validate_backprojection(xy_px, px_per_mm, baseline_px, v_u, fs=TARGET_FS):
-    """ხელახალი პროექცია და სიზუსტის გამოთვლა (ავტომატური ზომის დაქორექტირებით)."""
     if xy_px.size == 0 or len(v_u) == 0:
         return None
 
     t_sec = (xy_px[:,0] / px_per_mm)
     order = np.argsort(t_sec)
-    t = t_sec[order]
-    y = xy_px[:,1][order]
-    t, uniq = np.unique(t, return_index=True)
-    y = y[uniq]
+    t = t_sec[order]; y = xy_px[:,1][order]
+    t, uniq = np.unique(t, return_index=True); y = y[uniq]
 
     dt = 1.0/fs
     t0, t1 = float(t.min()), float(t.max())
     n = int((t1 - t0)/dt) + 1
-    t_u = t0 + np.arange(n) * dt
-
+    t_u = t0 + np.arange(n)*dt
     y_interp = np.interp(t_u, t, y)
     y_hat = baseline_px - (v_u * (px_per_mm * MM_PER_MV_DEFAULT))
 
     n_min = min(len(y_hat), len(y_interp))
     if n_min < 10:
         return None
-
-    y_hat = y_hat[:n_min]
-    y_interp = y_interp[:n_min]
+    y_hat, y_interp = y_hat[:n_min], y_interp[:n_min]
 
     err = y_hat - y_interp
     rmse = float(np.sqrt(np.mean(err**2)))
     rng = float(np.sqrt(np.mean((y_interp - np.median(y_interp))**2)))
-    if rng < 1e-6:
-        return 0.0
+    if rng < 1e-6: return 0.0
     acc = max(0.0, 1.0 - rmse / (rng + 1e-9))
     return 100.0 * acc
 
@@ -254,12 +247,12 @@ def extract_csv_and_report(svg_text, target_fs=TARGET_FS):
     px_per_mm = detect_px_per_mm_from_grid(root)
     ordered, lead_names, mm_per_s, mm_per_mV = pick_12_leads_from_paths(root, px_per_mm)
 
-    waveforms, baselines, accs = [], [], []
+    waveforms, accs = [], []
     min_len = math.inf
 
     for c in ordered:
         if c is None:
-            waveforms.append(np.array([])); baselines.append(None); accs.append(None); continue
+            waveforms.append(np.array([])); accs.append(None); continue
         xy = c["xy"]
         t_sec = (xy[:,0] / px_per_mm) / mm_per_s
         baseline = np.median(xy[:,1])
@@ -276,7 +269,6 @@ def extract_csv_and_report(svg_text, target_fs=TARGET_FS):
         else:
             v_u = np.array([])
         waveforms.append(v_u)
-        baselines.append(float(baseline))
         acc = validate_backprojection(xy, px_per_mm, baseline, v_u, fs=target_fs)
         accs.append(acc if acc is not None else None)
         if len(v_u) > 0:
@@ -294,23 +286,25 @@ def extract_csv_and_report(svg_text, target_fs=TARGET_FS):
     valid_accs = [a for a in accs if isinstance(a, (int, float))]
     overall = float(np.mean(valid_accs)) if valid_accs else 0.0
 
-    report = {
-        "px_per_mm": float(px_per_mm),
-        "mm_per_s": float(mm_per_s),
-        "mm_per_mV": float(mm_per_mV),
-        "fs_Hz": int(target_fs),
-        "lead_accuracy_percent": {lead_names[i]: (None if accs[i] is None else round(accs[i],2)) for i in range(12)},
+    header = {
+        "px_per_mm": round(px_per_mm, 3),
+        "mm_per_s": round(mm_per_s, 2),
+        "mm_per_mV": round(mm_per_mV, 2),
         "overall_accuracy_percent": round(overall, 2)
     }
-
     if overall < 80:
-        report["warning"] = "low signal match (<80%)"
+        header["warning"] = "low signal match (<80%)"
 
-    mem_csv = io.BytesIO()
-    df.to_csv(mem_csv, index=False, float_format="%.5f"); mem_csv.seek(0)
-    mem_json = io.BytesIO(json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8")); mem_json.seek(0)
+    # CSV memory
+    mem = io.StringIO()
+    # --- ჩაწერა report-ის თავში ---
+    for k, v in header.items():
+        mem.write(f"{k},{v}\n")
+    mem.write("\n")  # გამყოფი ხაზით
+    df.to_csv(mem, index=False, float_format="%.5f")
+    mem.seek(0)
 
-    return mem_csv, mem_json
+    return io.BytesIO(mem.getvalue().encode("utf-8"))
 
 # -------------------- Flask --------------------
 
@@ -327,13 +321,8 @@ def upload():
         return "Invalid file type", 400
 
     svg_text = f.read().decode("utf-8", errors="ignore")
-    csv_mem, json_mem = extract_csv_and_report(svg_text, target_fs=TARGET_FS)
+    csv_mem = extract_csv_and_report(svg_text, target_fs=TARGET_FS)
     base = f.filename.rsplit(".",1)[0]
-
-    if request.args.get("report") == "json":
-        return send_file(json_mem, as_attachment=True,
-                         download_name=f"{base}_report.json",
-                         mimetype="application/json")
 
     return send_file(csv_mem, as_attachment=True,
                      download_name=f"{base}_leads.csv",
