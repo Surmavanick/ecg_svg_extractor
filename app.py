@@ -11,9 +11,9 @@ from svg.path import parse_path
 app = Flask(__name__)
 
 # --- ნაგულისხმევი კალიბრაცია ---
-MM_PER_S_DEFAULT = 25.0   # 25mm/s → დრო
-MM_PER_MV_DEFAULT = 10.0  # 10mm/mV → ამპლიტუდა
-TARGET_FS = 500           # Hz (რესემპლინგი)
+MM_PER_S_DEFAULT = 25.0
+MM_PER_MV_DEFAULT = 10.0
+TARGET_FS = 500  # Hz
 
 LEAD_LABELS_STD = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
 
@@ -213,26 +213,39 @@ def pick_12_leads_from_paths(root, px_per_mm):
 # -------------------- Validation --------------------
 
 def validate_backprojection(xy_px, px_per_mm, baseline_px, v_u, fs=TARGET_FS):
+    """ხელახალი პროექცია და სიზუსტის გამოთვლა (ავტომატური ზომის დაქორექტირებით)."""
     if xy_px.size == 0 or len(v_u) == 0:
         return None
+
     t_sec = (xy_px[:,0] / px_per_mm)
     order = np.argsort(t_sec)
-    t = t_sec[order]; y = xy_px[:,1][order]
+    t = t_sec[order]
+    y = xy_px[:,1][order]
     t, uniq = np.unique(t, return_index=True)
     y = y[uniq]
+
     dt = 1.0/fs
     t0, t1 = float(t.min()), float(t.max())
     n = int((t1 - t0)/dt) + 1
-    t_u = t0 + np.arange(n)*dt
-    y_hat = baseline_px - (v_u * (px_per_mm*MM_PER_MV_DEFAULT))
+    t_u = t0 + np.arange(n) * dt
+
     y_interp = np.interp(t_u, t, y)
+    y_hat = baseline_px - (v_u * (px_per_mm * MM_PER_MV_DEFAULT))
+
+    n_min = min(len(y_hat), len(y_interp))
+    if n_min < 10:
+        return None
+
+    y_hat = y_hat[:n_min]
+    y_interp = y_interp[:n_min]
+
     err = y_hat - y_interp
     rmse = float(np.sqrt(np.mean(err**2)))
     rng = float(np.sqrt(np.mean((y_interp - np.median(y_interp))**2)))
     if rng < 1e-6:
         return 0.0
     acc = max(0.0, 1.0 - rmse / (rng + 1e-9))
-    return 100.0*acc
+    return 100.0 * acc
 
 # -------------------- Extraction --------------------
 
@@ -289,6 +302,9 @@ def extract_csv_and_report(svg_text, target_fs=TARGET_FS):
         "lead_accuracy_percent": {lead_names[i]: (None if accs[i] is None else round(accs[i],2)) for i in range(12)},
         "overall_accuracy_percent": round(overall, 2)
     }
+
+    if overall < 80:
+        report["warning"] = "low signal match (<80%)"
 
     mem_csv = io.BytesIO()
     df.to_csv(mem_csv, index=False, float_format="%.5f"); mem_csv.seek(0)
