@@ -1,5 +1,7 @@
 import io
+import json
 import math
+import re
 import numpy as np
 import pandas as pd
 from flask import Flask, render_template, request, send_file
@@ -8,59 +10,22 @@ from svg.path import parse_path
 
 app = Flask(__name__)
 
-# ECG calibration (from page footer): 25 mm/s, 10 mm/mV
-MM_PER_S = 25.0
-MM_PER_MV = 10.0
+# --- ნაგულისხმევი კალიბრაცია ---
+MM_PER_S_DEFAULT = 25.0   # 25mm/s → დრო
+MM_PER_MV_DEFAULT = 10.0  # 10mm/mV → ამპლიტუდა
+TARGET_FS = 500           # Hz (რესემპლინგი)
 
-# Output sampling rate (uniform grid)
-TARGET_FS = 500  # Hz (შეგიძლია შეცვალო 250/500-ზე)
+LEAD_LABELS_STD = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
 
-# -------------------- Helpers --------------------
+# -------------------- SVG utilities --------------------
 
 def _parse_float_with_unit(val):
-    """Return (value, unit) for attributes like '210mm' or '595'."""
     val = str(val).strip()
     num = ''.join(ch for ch in val if (ch.isdigit() or ch in '.-'))
     unit = val[len(num):].strip().lower()
     return float(num), unit
 
-def get_px_per_mm(svg_root):
-    """Compute px/mm from <svg width=.. height=.. viewBox=..>."""
-    viewBox = svg_root.get("viewBox")
-    if not viewBox:
-        # Conservative fallback: assume 96 dpi => ~3.7795 px/mm
-        return 3.7795275591
-
-    vb = [float(x) for x in viewBox.strip().split()]
-    if len(vb) != 4:
-        return 3.7795275591
-    vb_w = vb[2]  # in "user px"
-
-    width_attr = svg_root.get("width")
-    if width_attr:
-        width_val, width_unit = _parse_float_with_unit(width_attr)
-        if width_unit == "mm":
-            # px/mm = viewBox_width_px / width_mm
-            return vb_w / max(width_val, 1e-9)
-        elif width_unit == "px" or width_unit == "":
-            # width given in px; if we also have height in mm we could use that,
-            # otherwise assume A4 width=210mm as a reasonable default.
-            return (width_val / 210.0)
-    # height in mm?
-    height_attr = svg_root.get("height")
-    if height_attr:
-        h_val, h_unit = _parse_float_with_unit(height_attr)
-        vb_h = svg_root.get("viewBox")
-        if h_unit == "mm":
-            vb = [float(x) for x in viewBox.strip().split()]
-            vb_h_val = vb[3]
-            return vb_h_val / max(h_val, 1e-9)
-
-    # Final fallback
-    return 3.7795275591  # 96 dpi
-
-def sample_path_points(d_attr, samples_per_segment=60):
-    """Sample a <path d='...'> into Nx2 array of [x_px, y_px]."""
+def _sample_path_points(d_attr, samples_per_segment=80):
     try:
         path = parse_path(d_attr)
     except Exception:
@@ -73,103 +38,120 @@ def sample_path_points(d_attr, samples_per_segment=60):
             pts.append([float(z.real), float(z.imag)])
     return np.array(pts)
 
-def pick_12_leads(candidates, view_w):
-    """
-    candidates: list of dicts with keys:
-      'xy' (Nx2), 'y_mean', 'x_min', 'x_range', 'y_std'
-    Strategy:
-      - take top signals by x_range and y_std (avoid grid/flat lines)
-      - order by y_mean (top→bottom) into 4 rows, 3 per row
-      - inside each row order by x_min (left→right)
-    """
-    if len(candidates) <= 12:
-        chosen = candidates
-    else:
-        # Score: prioritize long and variable traces
-        scores = []
-        for c in candidates:
-            score = (c["x_range"] / max(view_w, 1e-6)) + (c["y_std"])
-            scores.append(score)
-        idx = np.argsort(scores)[-12:]
-        chosen = [candidates[i] for i in idx]
+def _get_viewbox(root):
+    vb = root.get("viewBox")
+    if not vb:
+        return (0, 0, 1000, 1000)
+    a = [float(x) for x in vb.strip().split()]
+    return tuple(a) if len(a) == 4 else (0,0,1000,1000)
 
-    # sort by vertical position
-    chosen.sort(key=lambda c: c["y_mean"])
-    # chunk into rows of 3
-    rows = [chosen[i:i+3] for i in range(0, len(chosen), 3)]
-    # if for some reason not multiple of 3, pad last row
-    while len(rows) < 4:
-        rows.append([])
-    rows = rows[:4]
-    for r in rows:
-        r.sort(key=lambda c: c["x_min"])
+# -------------------- Grid detection --------------------
 
-    # Map rows to standard names
-    lead_names = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
-    ordered = []
-    for r in rows:
-        ordered.extend(r)
-    # If fewer than 12 managed to pass, pad with empties
-    while len(ordered) < 12:
-        ordered.append(None)
-    return ordered, lead_names
+def _median_neighbor_spacing(values):
+    v = np.sort(np.unique(np.round(values, 3)))
+    if len(v) < 2: return None
+    deltas = np.diff(v)
+    q1, q3 = np.percentile(deltas, [25, 75])
+    iqr = q3 - q1
+    lo, hi = max(1e-6, q1 - 1.5*iqr), q3 + 1.5*iqr
+    core = deltas[(deltas >= lo) & (deltas <= hi)]
+    if len(core) == 0: core = deltas
+    return float(np.median(core))
 
-def to_seconds_and_mV(xy_px, px_per_mm):
-    """Convert [x_px, y_px] -> (t_sec, v_mV) using calibration 25mm/s, 10mm/mV."""
-    if xy_px.size == 0:
-        return np.array([]), np.array([])
-    # Time: px -> mm -> s
-    t_sec = (xy_px[:, 0] / px_per_mm) / MM_PER_S
-    # Amplitude: baseline ~ median y, px -> mm -> mV (note: SVG y grows downward)
-    baseline_px = np.median(xy_px[:, 1])
-    v_mV = -((xy_px[:, 1] - baseline_px) / px_per_mm) / MM_PER_MV
-    return t_sec, v_mV
+def detect_px_per_mm_from_grid(root):
+    ns = {"svg": "http://www.w3.org/2000/svg"}
+    xs, ys = [], []
 
-def resample_uniform(t, v, fs=TARGET_FS):
-    """Resample to uniform time grid at fs (Hz) via linear interpolation."""
-    if len(t) < 2:
-        return np.array([]), np.array([])
-    t0 = float(t.min())
-    t1 = float(t.max())
-    # Build uniform grid
-    dt = 1.0 / fs
-    n = int((t1 - t0) / dt) + 1
-    t_uni = t0 + np.arange(n) * dt
-    # Remove any non-monotonic segments before interp
-    order = np.argsort(t)
-    t_sorted = t[order]
-    v_sorted = v[order]
-    # Unique times for np.interp
-    t_sorted, unique_idx = np.unique(t_sorted, return_index=True)
-    v_sorted = v_sorted[unique_idx]
-    v_uni = np.interp(t_uni, t_sorted, v_sorted)
-    return t_uni, v_uni
+    for ln in root.findall(".//svg:line", ns):
+        x1 = ln.get("x1"); x2 = ln.get("x2")
+        y1 = ln.get("y1"); y2 = ln.get("y2")
+        try:
+            x1 = float(x1); x2 = float(x2)
+            y1 = float(y1); y2 = float(y2)
+        except:
+            continue
+        if abs(x2 - x1) < 0.5 and abs(y2 - y1) > 5:
+            xs.append(x1)
+        if abs(y2 - y1) < 0.5 and abs(x2 - x1) > 5:
+            ys.append(y1)
 
-# -------------------- Core extraction --------------------
+    px_step_x = _median_neighbor_spacing(xs) if len(xs) > 0 else None
+    px_step_y = _median_neighbor_spacing(ys) if len(ys) > 0 else None
+    steps = [s for s in [px_step_x, px_step_y] if s]
+    if not steps:
+        vb = _get_viewbox(root)
+        width_attr = root.get("width")
+        if width_attr:
+            w_val, w_unit = _parse_float_with_unit(width_attr)
+            if w_unit == "mm":
+                return vb[2] / max(w_val, 1e-9)
+        return 3.7795275591  # fallback
 
-def extract_csv_from_svg(svg_text, target_fs=TARGET_FS):
-    root = ET.fromstring(svg_text)
-    px_per_mm = get_px_per_mm(root)
+    step = float(np.median(steps))
+    per_mm_guess = step / 5.0
+    if 2.0 <= per_mm_guess <= 6.0:
+        return per_mm_guess
+    return step
 
-    # get viewBox width for scoring
-    vb = [float(x) for x in root.get("viewBox").split()]
-    view_w = vb[2] if len(vb) == 4 else 1000.0
+# -------------------- Text-based metadata --------------------
 
-    # Collect candidate paths
+def parse_text_meta_and_labels(root):
+    ns = {"svg": "http://www.w3.org/2000/svg"}
+    texts = root.findall(".//svg:text", ns)
+    meta = {"mm_per_s": None, "mm_per_mV": None, "band_hz": None}
+    label_pos = {}
+
+    mmps_re  = re.compile(r'(\d+(?:\.\d+)?)\s*mm/s', re.I)
+    mmpmV_re = re.compile(r'(\d+(?:\.\d+)?)\s*mm/mV', re.I)
+    band_re  = re.compile(r'(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)\s*Hz', re.I)
+
+    for t in texts:
+        txt = "".join(t.itertext()).strip()
+        if not txt:
+            continue
+
+        m1 = mmps_re.search(txt)
+        if m1: meta["mm_per_s"] = float(m1.group(1))
+        m2 = mmpmV_re.search(txt)
+        if m2: meta["mm_per_mV"] = float(m2.group(1))
+        m3 = band_re.search(txt)
+        if m3: meta["band_hz"] = (float(m3.group(1)), float(m3.group(2)))
+
+        clean = txt.replace(" ", "").upper()
+        if clean in [s.upper() for s in LEAD_LABELS_STD]:
+            x_attr = t.get("x"); y_attr = t.get("y")
+            if (x_attr is None or y_attr is None) and len(list(t)):
+                ts = list(t)[0]
+                x_attr = x_attr or ts.get("x")
+                y_attr = y_attr or ts.get("y")
+            try:
+                x = float(x_attr); y = float(y_attr)
+                for std in LEAD_LABELS_STD:
+                    if clean == std.replace(" ", "").upper():
+                        label_pos[std] = (x, y)
+                        break
+            except:
+                pass
+
+    return meta, label_pos
+
+# -------------------- Lead picking --------------------
+
+def pick_12_leads_from_paths(root, px_per_mm):
     ns = {"svg": "http://www.w3.org/2000/svg"}
     paths = root.findall(".//svg:path", ns)
+    vb = _get_viewbox(root)
+    view_w = vb[2]
 
     candidates = []
     for p in paths:
         d = p.get("d")
-        if not d:
-            continue
-        xy = sample_path_points(d, samples_per_segment=60)
-        if xy.shape[0] < 30:
-            continue
+        if not d: continue
+        xy = _sample_path_points(d, 80)
+        if xy.shape[0] < 50: continue
         x_rng = float(xy[:,0].max() - xy[:,0].min())
         y_std = float(np.std(xy[:,1]))
-        if x_rng < 0.10 * view_w or y_std < 0.5:  # heuristics: skip tiny/flat shapes (grid, ticks)
+        if x_rng < 0.15*view_w or y_std < 0.8:
             continue
         candidates.append({
             "xy": xy,
@@ -179,37 +161,142 @@ def extract_csv_from_svg(svg_text, target_fs=TARGET_FS):
             "y_std": y_std
         })
 
-    ordered, lead_names = pick_12_leads(candidates, view_w)
+    meta, label_pos = parse_text_meta_and_labels(root)
+    label_y = {k: v[1] for k, v in label_pos.items()}
+    have_labels = len(label_y) >= 8
 
-    # Build uniform, equal-length arrays
-    waveforms = []
+    ordered = [None]*12
+    names = LEAD_LABELS_STD.copy()
+
+    if have_labels and len(candidates) > 0:
+        unused = set(range(len(candidates)))
+        for li, name in enumerate(names):
+            if name not in label_y:
+                continue
+            want_y = label_y[name]
+            best, best_idx = None, None
+            for ci in list(unused):
+                dy = abs(candidates[ci]["y_mean"] - want_y)
+                if (best is None) or (dy < best):
+                    best, best_idx = dy, ci
+            if best_idx is not None:
+                ordered[li] = candidates[best_idx]
+                unused.remove(best_idx)
+        rest = [candidates[i] for i in unused]
+        rest.sort(key=lambda c: (c["y_mean"], c["x_min"]))
+        for li in range(12):
+            if ordered[li] is None and rest:
+                ordered[li] = rest.pop(0)
+    else:
+        chosen = candidates
+        if len(chosen) > 12:
+            scores = np.array([(c["x_range"]/view_w) + 0.5*np.log1p(c["y_std"]) for c in chosen])
+            idx = np.argsort(scores)[-12:]
+            chosen = [chosen[i] for i in idx]
+        chosen.sort(key=lambda c: c["y_mean"])
+        rows = [chosen[i:i+3] for i in range(0, len(chosen), 3)]
+        while len(rows) < 4:
+            rows.append([])
+        for r in rows:
+            r.sort(key=lambda c: c["x_min"])
+        ordered = []
+        for r in rows:
+            ordered.extend(r)
+        while len(ordered) < 12:
+            ordered.append(None)
+
+    mm_per_s  = meta["mm_per_s"]  if meta["mm_per_s"]  else MM_PER_S_DEFAULT
+    mm_per_mV = meta["mm_per_mV"] if meta["mm_per_mV"] else MM_PER_MV_DEFAULT
+
+    return ordered, names, mm_per_s, mm_per_mV
+
+# -------------------- Validation --------------------
+
+def validate_backprojection(xy_px, px_per_mm, baseline_px, v_u, fs=TARGET_FS):
+    if xy_px.size == 0 or len(v_u) == 0:
+        return None
+    t_sec = (xy_px[:,0] / px_per_mm)
+    order = np.argsort(t_sec)
+    t = t_sec[order]; y = xy_px[:,1][order]
+    t, uniq = np.unique(t, return_index=True)
+    y = y[uniq]
+    dt = 1.0/fs
+    t0, t1 = float(t.min()), float(t.max())
+    n = int((t1 - t0)/dt) + 1
+    t_u = t0 + np.arange(n)*dt
+    y_hat = baseline_px - (v_u * (px_per_mm*MM_PER_MV_DEFAULT))
+    y_interp = np.interp(t_u, t, y)
+    err = y_hat - y_interp
+    rmse = float(np.sqrt(np.mean(err**2)))
+    rng = float(np.sqrt(np.mean((y_interp - np.median(y_interp))**2)))
+    if rng < 1e-6:
+        return 0.0
+    acc = max(0.0, 1.0 - rmse / (rng + 1e-9))
+    return 100.0*acc
+
+# -------------------- Extraction --------------------
+
+def extract_csv_and_report(svg_text, target_fs=TARGET_FS):
+    root = ET.fromstring(svg_text)
+    px_per_mm = detect_px_per_mm_from_grid(root)
+    ordered, lead_names, mm_per_s, mm_per_mV = pick_12_leads_from_paths(root, px_per_mm)
+
+    waveforms, baselines, accs = [], [], []
     min_len = math.inf
+
     for c in ordered:
         if c is None:
-            waveforms.append(np.array([]))
-            continue
-        t, v = to_seconds_and_mV(c["xy"], px_per_mm)
-        t_u, v_u = resample_uniform(t, v, fs=target_fs)
+            waveforms.append(np.array([])); baselines.append(None); accs.append(None); continue
+        xy = c["xy"]
+        t_sec = (xy[:,0] / px_per_mm) / mm_per_s
+        baseline = np.median(xy[:,1])
+        v_mV = -((xy[:,1] - baseline) / px_per_mm) / mm_per_mV
+        if len(t_sec) >= 2:
+            order = np.argsort(t_sec)
+            t = t_sec[order]; v = v_mV[order]
+            t, uniq = np.unique(t, return_index=True); v = v[uniq]
+            dt = 1.0/target_fs
+            t0, t1 = float(t.min()), float(t.max())
+            n = int((t1 - t0)/dt) + 1
+            t_u = t0 + np.arange(n)*dt
+            v_u = np.interp(t_u, t, v)
+        else:
+            v_u = np.array([])
         waveforms.append(v_u)
+        baselines.append(float(baseline))
+        acc = validate_backprojection(xy, px_per_mm, baseline, v_u, fs=target_fs)
+        accs.append(acc if acc is not None else None)
         if len(v_u) > 0:
             min_len = min(min_len, len(v_u))
 
-    # Truncate all to the shortest length so CSV columns align
     if min_len is math.inf:
         min_len = 0
+
     data = np.full((min_len, 12), np.nan, dtype=float)
     for j, v in enumerate(waveforms):
         if len(v) >= min_len and min_len > 0:
             data[:, j] = v[:min_len]
 
     df = pd.DataFrame(data, columns=lead_names)
+    valid_accs = [a for a in accs if isinstance(a, (int, float))]
+    overall = float(np.mean(valid_accs)) if valid_accs else 0.0
 
-    mem = io.BytesIO()
-    df.to_csv(mem, index=False, float_format="%.5f")
-    mem.seek(0)
-    return mem
+    report = {
+        "px_per_mm": float(px_per_mm),
+        "mm_per_s": float(mm_per_s),
+        "mm_per_mV": float(mm_per_mV),
+        "fs_Hz": int(target_fs),
+        "lead_accuracy_percent": {lead_names[i]: (None if accs[i] is None else round(accs[i],2)) for i in range(12)},
+        "overall_accuracy_percent": round(overall, 2)
+    }
 
-# -------------------- Flask routes --------------------
+    mem_csv = io.BytesIO()
+    df.to_csv(mem_csv, index=False, float_format="%.5f"); mem_csv.seek(0)
+    mem_json = io.BytesIO(json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8")); mem_json.seek(0)
+
+    return mem_csv, mem_json
+
+# -------------------- Flask --------------------
 
 @app.route("/")
 def index():
@@ -224,9 +311,17 @@ def upload():
         return "Invalid file type", 400
 
     svg_text = f.read().decode("utf-8", errors="ignore")
-    csv_mem = extract_csv_from_svg(svg_text, target_fs=TARGET_FS)
-    out_name = f"{f.filename.rsplit('.',1)[0]}_leads.csv"
-    return send_file(csv_mem, as_attachment=True, download_name=out_name, mimetype="text/csv")
+    csv_mem, json_mem = extract_csv_and_report(svg_text, target_fs=TARGET_FS)
+    base = f.filename.rsplit(".",1)[0]
+
+    if request.args.get("report") == "json":
+        return send_file(json_mem, as_attachment=True,
+                         download_name=f"{base}_report.json",
+                         mimetype="application/json")
+
+    return send_file(csv_mem, as_attachment=True,
+                     download_name=f"{base}_leads.csv",
+                     mimetype="text/csv")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
