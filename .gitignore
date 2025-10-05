@@ -1,0 +1,17 @@
+# .gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.venv/
+
+# Temporary files created by the app
+temp_files/
+
+# OS-specific files
+.DS_Store
